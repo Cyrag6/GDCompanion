@@ -14,6 +14,7 @@ public static class NavigationOverlayProjection
     private const int MinimumPoiTargets = 8;
     private const int MaximumNearbyTravelTargets = 8;
     private const int MaximumRiftgates = 2;
+    private const int MaximumDevotionShrines = 1;
     private const double PoiEdgeRatio = 0.91;
     private const double QuestEdgeRatio = 1.05;
     private const double InverseSqrtTwo = 0.7071067811865476;
@@ -26,7 +27,7 @@ public static class NavigationOverlayProjection
         bool showPointsOfInterest,
         double displayRange,
         string? currentLevelPath = null, MinimapProjection? projection = null, QuestNavigationState? questState = null,
-        PoiFilter poiFilter = PoiFilter.All)
+        PoiFilter poiFilter = PoiFilter.All, IReadOnlySet<string>? restoredShrineUids = null, int? gameDifficulty = null)
     {
         displayRange = projection?.DisplayRange ?? Math.Clamp(displayRange, 25, 100);
         var active = activeQuestPaths.Select(NormalizeQuestPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -66,13 +67,16 @@ public static class NavigationOverlayProjection
         {
             // Filter before quotas/fallback selection, but retain all original
             // points for quest-region anchoring. POI preferences cannot hide quests.
-            var poiPoints = points.Where(point => PoiFilters.Allows(poiFilter, point.Marker.Category)).ToArray();
+            var poiPoints = points.Where(point => PoiFilters.Allows(poiFilter, point.Marker.Category) &&
+                                                  !IsExcludedDevotionShrine(point.Marker, restoredShrineUids, gameDifficulty))
+                .ToArray();
             // Game-owned live markers are the only reliable nearby POIs: the
             // installed catalog spans separate world maps whose coordinates
             // can overlap. Catalog entries remain useful as distant bearings.
-            var nearbyNonRiftLive = poiPoints.Where(point => point.Marker.Category != "Quest Objective" &&
-                                                             IsLive(point.Marker) && !IsRiftgate(point.Marker) &&
-                                                             point.Distance <= displayRange)
+            var nearbyOtherLive = poiPoints.Where(point => point.Marker.Category != "Quest Objective" &&
+                                                           IsLive(point.Marker) && !IsRiftgate(point.Marker) &&
+                                                           !IsDevotionShrine(point.Marker) &&
+                                                           point.Distance <= displayRange)
                 .OrderBy(point => point.Distance)
                 .Take(MaximumPoiTargets)
                 .ToArray();
@@ -86,6 +90,18 @@ public static class NavigationOverlayProjection
             var selectedRiftgates = SelectClosestRiftgates(liveRiftgates, catalogRiftgates, allCatalogRiftgates);
             var nearbyRiftgates = selectedRiftgates.Where(point => point.Distance <= displayRange).ToArray();
             var distantRiftgates = selectedRiftgates.Where(point => point.Distance > displayRange).ToArray();
+            var currentShrineRegion = LevelRegionFamily(currentLevelPath ?? "");
+            var liveShrines = poiPoints.Where(point => IsLive(point.Marker) && IsDevotionShrine(point.Marker))
+                .OrderBy(point => point.Distance)
+                .ToArray();
+            var catalogShrines = poiPoints.Where(point => IsDevotionShrine(point.Marker) && !IsLive(point.Marker) &&
+                                                          point.Distance > displayRange &&
+                                                          MatchesShrineLocationDomain(currentShrineRegion, point.Marker))
+                .OrderBy(point => point.Distance)
+                .ToArray();
+            var selectedShrines = SelectClosestDevotionShrines(liveShrines, catalogShrines);
+            var nearbyShrines = selectedShrines.Where(point => point.Distance <= displayRange).ToArray();
+            var distantShrines = selectedShrines.Where(point => point.Distance > displayRange).ToArray();
             // Static boats and ferries are absent from some game minimap
             // passes. Their catalog placements are safe and useful nearby,
             // while other catalog POIs stay direction-only to avoid markers
@@ -95,18 +111,22 @@ public static class NavigationOverlayProjection
                 .OrderBy(point => point.Distance)
                 .Take(MaximumNearbyTravelTargets)
                 .ToArray();
-            var nearby = nearbyNonRiftLive.Concat(nearbyTravel).Concat(nearbyRiftgates)
+            var nearby = nearbyRiftgates.Concat(nearbyShrines).Concat(nearbyOtherLive).Concat(nearbyTravel)
                 .DistinctBy(point => point.Marker.Id)
-                .Take(Math.Max(0, MaximumPoiTargets - distantRiftgates.Length))
+                .Take(Math.Max(0, MaximumPoiTargets - distantRiftgates.Length - distantShrines.Length))
                 .ToArray();
             var fallbackCount = Math.Max(0, MinimumPoiTargets - nearby.Length);
             var distant = poiPoints.Where(point => point.Marker.Category != "Quest Objective" &&
                                                 point.Marker.Category != "Riftgate" &&
+                                                !IsDevotionShrine(point.Marker) &&
                                                 !IsLive(point.Marker) &&
                                                 point.Distance > displayRange)
                 .OrderBy(point => point.Distance)
                 .Take(fallbackCount);
-            pois = nearby.Concat(distantRiftgates).Concat(distant).DistinctBy(point => point.Marker.Id).Take(MaximumPoiTargets).ToArray();
+            pois = nearby.Concat(distantRiftgates).Concat(distantShrines).Concat(distant)
+                .DistinctBy(point => point.Marker.Id)
+                .Take(MaximumPoiTargets)
+                .ToArray();
         }
 
         return quests.Concat(pois).Select(point => Project(player, point, displayRange, projection)).ToArray();
@@ -311,6 +331,51 @@ public static class NavigationOverlayProjection
         value.Equals("Riftgate", StringComparison.OrdinalIgnoreCase) ||
         value.Equals("Travel Utility", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsDevotionShrine(WorldMarkerRecord marker) => marker.Category == "Devotion Shrine";
+
+    private static bool IsOverworldRegionFamily(string? family)
+    {
+        if (string.IsNullOrEmpty(family)) return false;
+        var slash = family.LastIndexOf('/');
+        var directory = slash >= 0 ? family[..slash] : "";
+        var stem = slash >= 0 ? family[(slash + 1)..] : family;
+        return stem.Length == 8 &&
+               stem.StartsWith("region0", StringComparison.Ordinal) &&
+               char.IsLetter(stem[7]) &&
+               directory is "" or "levels" or "levels/waterregions" or "levels/sideareas";
+    }
+
+    private static bool MatchesShrineLocationDomain(string? currentRegionFamily, WorldMarkerRecord marker)
+    {
+        if (currentRegionFamily is null) return true;
+        var markerFamily = LevelRegionFamily(marker.LevelPath);
+        if (markerFamily is null) return false;
+        if (IsOverworldRegionFamily(currentRegionFamily))
+            return IsOverworldRegionFamily(markerFamily);
+        return string.Equals(markerFamily, currentRegionFamily, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsExcludedDevotionShrine(
+        WorldMarkerRecord marker,
+        IReadOnlySet<string>? restoredShrineUids,
+        int? gameDifficulty)
+    {
+        if (!IsDevotionShrine(marker)) return false;
+        if (IsLive(marker))
+            return string.Equals(marker.DisplayName?.Trim(), "Restored Shrine", StringComparison.OrdinalIgnoreCase);
+        if (marker.HideMapIcon) return true;
+        if (gameDifficulty is >= 0 and <= 2 &&
+            (marker.DisabledDifficultiesMask & (1 << gameDifficulty.Value)) != 0)
+            return true;
+        return restoredShrineUids is not null && !string.IsNullOrEmpty(marker.EntityUid) &&
+               restoredShrineUids.Contains(marker.EntityUid);
+    }
+
+    private static Candidate[] SelectClosestDevotionShrines(
+        IReadOnlyCollection<Candidate> liveShrines,
+        IReadOnlyCollection<Candidate> catalogShrines) =>
+        SelectClosestDistinct(liveShrines, catalogShrines, MaximumDevotionShrines);
+
     private static Candidate[] SelectClosestRiftgates(
         IReadOnlyCollection<Candidate> liveRiftgates,
         IReadOnlyCollection<Candidate> catalogRiftgates,
@@ -328,17 +393,25 @@ public static class NavigationOverlayProjection
                 ? live
                 : live with { Marker = live.Marker with { DisplayName = match.Marker.DisplayName } };
         }).ToArray();
-        var filteredCatalog = catalogRiftgates.Where(point =>
-            !enrichedLive.Any(livePoint => MarkerDistance(livePoint.Marker, point.Marker) <= 16));
-        var selected = new List<Candidate>(MaximumRiftgates);
-        foreach (var candidate in enrichedLive.Concat(filteredCatalog)
+        return SelectClosestDistinct(enrichedLive, catalogRiftgates, MaximumRiftgates);
+    }
+
+    private static Candidate[] SelectClosestDistinct(
+        IReadOnlyCollection<Candidate> livePoints,
+        IReadOnlyCollection<Candidate> catalogPoints,
+        int maximumCount)
+    {
+        var filteredCatalog = catalogPoints.Where(point =>
+            !livePoints.Any(livePoint => MarkerDistance(livePoint.Marker, point.Marker) <= 16));
+        var selected = new List<Candidate>(maximumCount);
+        foreach (var candidate in livePoints.Concat(filteredCatalog)
                      .OrderBy(point => point.Distance)
                      .ThenBy(point => IsLive(point.Marker) ? 0 : 1))
         {
             if (selected.Any(existing => MarkerDistance(existing.Marker, candidate.Marker) <= 16))
                 continue;
             selected.Add(candidate);
-            if (selected.Count == MaximumRiftgates) break;
+            if (selected.Count == maximumCount) break;
         }
         return selected.ToArray();
     }

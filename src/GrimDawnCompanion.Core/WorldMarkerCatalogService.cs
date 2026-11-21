@@ -47,7 +47,7 @@ public sealed class WorldMarkerCatalogService
         var hashes = await Task.Run(() => archivePaths.Concat(questArchives).Select(path =>
             $"{Path.GetRelativePath(game.RootDirectory, path).Replace('\\', '/')}:{Hashing.Sha256File(path)}").ToArray(), cancellationToken);
         var fingerprint = Hashing.CombineFingerprint(hashes);
-        var riftgateNames = await Task.Run(() => ReadRiftgateDisplayNames(game, cancellationToken), cancellationToken);
+        var markerMetadata = await Task.Run(() => ReadArzMarkerMetadata(game, cancellationToken), cancellationToken);
         var allMarkers = new Dictionary<string, WorldMarkerRecord>(StringComparer.OrdinalIgnoreCase);
         foreach (var archivePath in archivePaths)
         {
@@ -62,7 +62,7 @@ public sealed class WorldMarkerCatalogService
                     ArcReader.CopyFirstEntryToStream(archivePath,
                         name => name.EndsWith("world001.map", StringComparison.OrdinalIgnoreCase), temporary);
                     temporary.Position = 0;
-                    foreach (var marker in ParsePrimaryPlacements(temporary, cancellationToken, questRecords, riftgateNames))
+                    foreach (var marker in ParsePrimaryPlacements(temporary, cancellationToken, questRecords, markerMetadata.RiftgateNames, markerMetadata.Shrines))
                         allMarkers[marker.Id] = marker;
                 }, cancellationToken);
             }
@@ -114,7 +114,8 @@ public sealed class WorldMarkerCatalogService
 
     internal static List<WorldMarkerRecord> ParsePrimaryPlacements(Stream world, CancellationToken cancellationToken = default,
         IReadOnlyDictionary<string, string[]>? questRecords = null,
-        IReadOnlyDictionary<string, string>? riftgateNames = null)
+        IReadOnlyDictionary<string, string>? riftgateNames = null,
+        IReadOnlyDictionary<string, ShrineMetadata>? shrineMetadata = null)
     {
         if (!world.CanSeek || world.Length < 8) throw new InvalidDataException("Compiled world map stream is invalid.");
         var header = ReadBytes(world, 0, 8);
@@ -132,7 +133,7 @@ public sealed class WorldMarkerCatalogService
         foreach (var level in levels)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { ParseLevel(world, level, markers, questRecords, riftgateNames); }
+            try { ParseLevel(world, level, markers, questRecords, riftgateNames, shrineMetadata); }
             catch (Exception exception) when (exception is InvalidDataException or OverflowException or DecoderFallbackException)
             {
                 // A malformed embedded level must not prevent the remaining
@@ -211,7 +212,8 @@ public sealed class WorldMarkerCatalogService
     }
 
     private static void ParseLevel(Stream world, LevelEntry level, List<WorldMarkerRecord> output,
-        IReadOnlyDictionary<string, string[]>? questRecords, IReadOnlyDictionary<string, string>? riftgateNames)
+        IReadOnlyDictionary<string, string[]>? questRecords, IReadOnlyDictionary<string, string>? riftgateNames,
+        IReadOnlyDictionary<string, ShrineMetadata>? shrineMetadata)
     {
         var offset = level.DataOffset;
         // The index scan may encounter incidental `.lvl` bytes. Reject those
@@ -230,14 +232,14 @@ public sealed class WorldMarkerCatalogService
             var dataStart = chunkCursor + 8;
             if (chunkSize > int.MaxValue || dataStart > levelEnd - chunkSize) return;
             if (chunkType == 5)
-                ParsePlacementChunk(world, dataStart, (int)chunkSize, level, output, questRecords, riftgateNames);
+                ParsePlacementChunk(world, dataStart, (int)chunkSize, level, output, questRecords, riftgateNames, shrineMetadata);
             chunkCursor = dataStart + chunkSize;
         }
     }
 
     private static void ParsePlacementChunk(Stream world, long dataStart, int dataLength, LevelEntry level,
         List<WorldMarkerRecord> output, IReadOnlyDictionary<string, string[]>? questRecords,
-        IReadOnlyDictionary<string, string>? riftgateNames)
+        IReadOnlyDictionary<string, string>? riftgateNames, IReadOnlyDictionary<string, ShrineMetadata>? shrineMetadata)
     {
         var dataEnd = dataStart + dataLength;
         var stringCountRaw = ReadU32(ReadBytes(world, dataStart, 4), 0);
@@ -261,29 +263,27 @@ public sealed class WorldMarkerCatalogService
         var placementCount = (int)placementCountRaw;
         for (var index = 0; index < placementCount; index++)
         {
-            // Instance-group members carry their 16-byte entity ID directly
-            // before the ordinary placement record. The first four ID bytes
-            // cannot be a record-table index; consume the prefix so later
-            // placements stay aligned. Quest NPCs such as Barnabas and
-            // Kasparov use this compiled-level layout.
-            var candidate = ReadU32(ReadBytes(world, cursor, 4), 0);
-            if (candidate >= (uint)strings.Length)
+            if (cursor > dataEnd - 56) return;
+            var placement = ReadBytes(world, cursor, 56);
+            cursor += 56;
+            // Placement flags at +52 indicate a trailing 16-byte Entity UniqueId
+            // copied verbatim into Player::GetShrineUIDs() when restored.
+            string? entityUid = null;
+            if (ReadU32(placement, 52) != 0)
             {
-                if (cursor > dataEnd - 72) return;
+                if (cursor > dataEnd - 16) return;
+                entityUid = Convert.ToHexString(ReadBytes(world, cursor, 16));
                 cursor += 16;
             }
-            else if (cursor > dataEnd - 56) return;
-
-            var placement = ReadBytes(world, cursor, 56);
             var recordIndexRaw = ReadU32(placement, 0);
-            AddPlacement(strings, recordIndexRaw, placement, 40, level, output, questRecords, riftgateNames);
-            cursor += 56;
+            AddPlacement(strings, recordIndexRaw, placement, 40, level, output, questRecords, riftgateNames, shrineMetadata, entityUid);
         }
     }
 
     private static void AddPlacement(string[] strings, uint recordIndexRaw, ReadOnlySpan<byte> placement,
         int coordinateOffset, LevelEntry level, List<WorldMarkerRecord> output,
-        IReadOnlyDictionary<string, string[]>? questRecords, IReadOnlyDictionary<string, string>? riftgateNames)
+        IReadOnlyDictionary<string, string[]>? questRecords, IReadOnlyDictionary<string, string>? riftgateNames,
+        IReadOnlyDictionary<string, ShrineMetadata>? shrineMetadata, string? entityUid = null)
     {
         if (recordIndexRaw >= (uint)strings.Length) return;
         var recordPath = strings[(int)recordIndexRaw].Replace('\\', '/');
@@ -302,7 +302,12 @@ public sealed class WorldMarkerCatalogService
                           riftgateNames.TryGetValue(normalizedRecord, out var localizedRiftgate)
             ? localizedRiftgate
             : DisplayName(recordPath, category);
-        output.Add(new WorldMarkerRecord(id, category, recordPath, level.Name, x, y, z, questPaths, displayName));
+        ShrineMetadata? shrine = null;
+        if (category == "Devotion Shrine") shrineMetadata?.TryGetValue(normalizedRecord, out shrine);
+        output.Add(new WorldMarkerRecord(id, category, recordPath, level.Name, x, y, z, questPaths, displayName,
+            EntityUid: entityUid,
+            DisabledDifficultiesMask: shrine?.DisabledDifficultiesMask ?? 0,
+            HideMapIcon: shrine?.HideMapIcon ?? false));
     }
 
     private static Dictionary<string, string[]> ReadQuestRecordAssociations(GameInstallation game, IEnumerable<string> archives,
@@ -383,9 +388,10 @@ public sealed class WorldMarkerCatalogService
             System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(name.ToLowerInvariant());
     }
 
-    private static Dictionary<string, string> ReadRiftgateDisplayNames(GameInstallation game, CancellationToken cancellationToken)
+    private static ArzMarkerMetadata ReadArzMarkerMetadata(GameInstallation game, CancellationToken cancellationToken)
     {
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var riftgateNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var shrines = new Dictionary<string, ShrineMetadata>(StringComparer.OrdinalIgnoreCase);
         var archives = GameLocator.GetInstalledArchives(game)
             .Where(archive => archive.Id is "base" or "gdx1" or "gdx2" or "gdx3")
             .ToArray();
@@ -403,18 +409,18 @@ public sealed class WorldMarkerCatalogService
             }
             catch (Exception) when (!cancellationToken.IsCancellationRequested) { }
         }
-        if (tags.Count == 0) return result;
         foreach (var archive in archives)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { ReadRiftgateTagsFromArz(archive.DatabasePath, tags, result, cancellationToken); }
+            try { ReadMarkerMetadataFromArz(archive.DatabasePath, tags, riftgateNames, shrines, cancellationToken); }
             catch (Exception) when (!cancellationToken.IsCancellationRequested) { }
         }
-        return result;
+        return new ArzMarkerMetadata(riftgateNames, shrines);
     }
 
-    private static void ReadRiftgateTagsFromArz(string arzPath, IReadOnlyDictionary<string, string> tags,
-        Dictionary<string, string> output, CancellationToken cancellationToken)
+    private static void ReadMarkerMetadataFromArz(string arzPath, IReadOnlyDictionary<string, string> tags,
+        Dictionary<string, string> riftgateNames, Dictionary<string, ShrineMetadata> shrines,
+        CancellationToken cancellationToken)
     {
         using var stream = File.OpenRead(arzPath);
         if (stream.Length < 24) return;
@@ -462,7 +468,9 @@ public sealed class WorldMarkerCatalogService
             rc += 8; // timestamp
             if (nameId >= stringCount) continue;
             var recordPath = strings[nameId].Replace('\\', '/').TrimStart('/');
-            if (Classify(recordPath) != "Riftgate") continue;
+            var category = Classify(recordPath);
+            if (category is not ("Riftgate" or "Devotion Shrine")) continue;
+            if (category == "Riftgate" && tags.Count == 0) continue;
             if (uncompressedSize > 4 * 1024 * 1024 || compressedSize > stream.Length) continue;
             var fileOffset = 24L + dataOffset;
             if (fileOffset < 24 || fileOffset > stream.Length - compressedSize) continue;
@@ -471,6 +479,8 @@ public sealed class WorldMarkerCatalogService
                 ? compressed
                 : ArcReader.DecompressBlock(compressed, (int)uncompressedSize);
             string? description = null, actorName = null, teleportTag = null, zoneTag = null;
+            byte disabledMask = 0;
+            var hideMapIcon = false;
             var fc = 0;
             while (fc <= raw.Length - 8)
             {
@@ -480,30 +490,47 @@ public sealed class WorldMarkerCatalogService
                 fc += 8;
                 var valueBytes = (long)valueCount * 4;
                 if (valueBytes > raw.Length - fc) break;
-                if (dataType == 2 && valueCount >= 1 && keyId < stringCount)
+                if (keyId < stringCount && valueCount >= 1)
                 {
-                    var valId = ReadU32(raw, fc);
-                    if (valId < stringCount)
+                    var key = strings[keyId];
+                    if (category == "Riftgate" && dataType == 2)
                     {
-                        var key = strings[keyId];
-                        var value = strings[valId];
-                        if (key.Equals("description", StringComparison.OrdinalIgnoreCase)) description = value;
-                        else if (key.Equals("ActorName", StringComparison.OrdinalIgnoreCase)) actorName = value;
-                        else if (key.Equals("TeleportNameTag", StringComparison.OrdinalIgnoreCase)) teleportTag = value;
-                        else if (key.Equals("ZoneNameTag", StringComparison.OrdinalIgnoreCase)) zoneTag = value;
+                        var valId = ReadU32(raw, fc);
+                        if (valId < stringCount)
+                        {
+                            var value = strings[valId];
+                            if (key.Equals("description", StringComparison.OrdinalIgnoreCase)) description = value;
+                            else if (key.Equals("ActorName", StringComparison.OrdinalIgnoreCase)) actorName = value;
+                            else if (key.Equals("TeleportNameTag", StringComparison.OrdinalIgnoreCase)) teleportTag = value;
+                            else if (key.Equals("ZoneNameTag", StringComparison.OrdinalIgnoreCase)) zoneTag = value;
+                        }
+                    }
+                    else if (category == "Devotion Shrine" && dataType is 0 or 3 && ReadU32(raw, fc) != 0)
+                    {
+                        if (key.Equals("normalDisabled", StringComparison.OrdinalIgnoreCase)) disabledMask |= 1;
+                        else if (key.Equals("epicDisabled", StringComparison.OrdinalIgnoreCase)) disabledMask |= 2;
+                        else if (key.Equals("legendaryDisabled", StringComparison.OrdinalIgnoreCase)) disabledMask |= 4;
+                        else if (key.Equals("hideMapIcon", StringComparison.OrdinalIgnoreCase)) hideMapIcon = true;
                     }
                 }
                 fc += (int)valueBytes;
             }
-            foreach (var tag in new[] { description, actorName, teleportTag, zoneTag })
+            if (category == "Riftgate")
             {
-                if (string.IsNullOrWhiteSpace(tag) || !tags.TryGetValue(tag, out var localized)) continue;
-                var cleaned = Regex.Replace(localized, @"\{\^[^}]*\}", "").Trim();
-                if (cleaned.Length > 0)
+                foreach (var tag in new[] { description, actorName, teleportTag, zoneTag })
                 {
-                    output[recordPath] = cleaned;
-                    break;
+                    if (string.IsNullOrWhiteSpace(tag) || !tags.TryGetValue(tag, out var localized)) continue;
+                    var cleaned = Regex.Replace(localized, @"\{\^[^}]*\}", "").Trim();
+                    if (cleaned.Length > 0)
+                    {
+                        riftgateNames[recordPath] = cleaned;
+                        break;
+                    }
                 }
+            }
+            else
+            {
+                shrines[recordPath] = new ShrineMetadata(disabledMask, hideMapIcon);
             }
         }
     }
@@ -532,5 +559,9 @@ public sealed class WorldMarkerCatalogService
         return result;
     }
 
+    internal sealed record ShrineMetadata(byte DisabledDifficultiesMask, bool HideMapIcon);
+    private sealed record ArzMarkerMetadata(
+        Dictionary<string, string> RiftgateNames,
+        Dictionary<string, ShrineMetadata> Shrines);
     private sealed record LevelEntry(string Name, long DataOffset, long DataLength, float OriginX, float OriginY, float OriginZ);
 }

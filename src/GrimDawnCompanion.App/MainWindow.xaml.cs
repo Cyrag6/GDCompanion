@@ -37,6 +37,8 @@ public partial class MainWindow : Window
     private bool _nativeRadarSubmitted;
     private IReadOnlyList<LiveMapMarkerRecord> _liveMapMarkers = [];
     private IReadOnlyList<LiveMapMarkerRecord> _regionalQuestMarkers = [];
+    private IReadOnlySet<string> _restoredShrineUids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private int? _gameDifficulty;
     private string? _currentLevelPath;
     private MinimapGeometry? _minimapGeometry;
     private readonly RegionalQuestMarkerCache _questMarkerCache = new();
@@ -665,6 +667,8 @@ public partial class MainWindow : Window
         _activeQuestPaths = [];
         _liveMapMarkers = [];
         _regionalQuestMarkers = [];
+        _restoredShrineUids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _gameDifficulty = null;
         _currentLevelPath = null;
         _questMarkerCache.Clear();
         _navigationTimer ??= new DispatcherTimer(DispatcherPriority.Render)
@@ -720,6 +724,15 @@ public partial class MainWindow : Window
                             ? "Quest data unavailable — long-range objectives cannot be resolved yet."
                             : $"Quest data: {_activeQuestPaths.Count} active tracked quests • {catalogObjectives.Count} catalog targets in this map region.";
                 _liveMapMarkers = await _bridge.GetLiveMapMarkersAsync(_lifetime.Token);
+                if (_bridge.SupportsRestoredShrines)
+                {
+                    var restoredShrines = await _bridge.GetRestoredShrineStateAsync(_lifetime.Token);
+                    if (restoredShrines is not null)
+                    {
+                        _restoredShrineUids = restoredShrines.Uids;
+                        _gameDifficulty = restoredShrines.Difficulty;
+                    }
+                }
                 var region = NavigationOverlayProjection.ResolveRegionFamily(_currentLevelPath) ??
                              NavigationOverlayProjection.ResolveCurrentRegionFamily(
                                  player, _navigationCatalog.Markers, NavigationCatalogRange);
@@ -744,6 +757,8 @@ public partial class MainWindow : Window
                 await _bridge.ClearNativeRadarAsync(_lifetime.Token);
                 _nativeRadarContext = _minimapGeometry.RenderContext;
                 _nativeRadarSubmitted = false;
+                _restoredShrineUids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _gameDifficulty = null;
                 _navigationPollCount = 0; // Refresh map/quest selection before using the new render context.
                 return;
             }
@@ -752,7 +767,7 @@ public partial class MainWindow : Window
             {
                 var selected = NavigationOverlayProjection.Build(player, _navigationCatalog.Markers.Concat(liveMarkers), _activeQuestPaths,
                     NavigationQuestBox.IsChecked == true, NavigationPoiBox.IsChecked == true, NavigationCatalogRange,
-                    _currentLevelPath, _minimapGeometry.Projection, _questNavigationState, _settings.EnabledPoiTypes);
+                    _currentLevelPath, _minimapGeometry.Projection, _questNavigationState, _settings.EnabledPoiTypes, _restoredShrineUids, _gameDifficulty);
                 await _bridge.SetNativeRadarFrameAsync(_nativeRadarContext, selected, _lifetime.Token);
                 _nativeRadarSubmitted = true;
             }
@@ -792,6 +807,8 @@ public partial class MainWindow : Window
         _activeQuestPaths = [];
         _liveMapMarkers = [];
         _regionalQuestMarkers = [];
+        _restoredShrineUids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _gameDifficulty = null;
         _currentLevelPath = null;
         _minimapGeometry = null;
         _questMarkerCache.Clear();
